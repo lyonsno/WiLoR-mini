@@ -8,6 +8,11 @@ import torch
 from torch import nn
 
 
+DEVICES = ["cpu"]
+if torch.backends.mps.is_available():
+    DEVICES.append("mps")
+
+
 @pytest.fixture()
 def lightweight_model_imports():
     module_names = [
@@ -73,11 +78,15 @@ def lightweight_model_imports():
 
 
 class _ContiguousBackbone(nn.Module):
+    def __init__(self, expected_device):
+        super().__init__()
+        self.expected_device = expected_device
+
     def forward(self, image_crop):
-        assert image_crop.device.type == "mps"
+        assert image_crop.device.type == self.expected_device
         assert image_crop.shape == (1, 3, 256, 192)
         assert image_crop.is_contiguous(), (
-            "MPS backbone input must be contiguous after the width crop"
+            "Backbone input must be contiguous after the width crop"
         )
 
         batch_size = image_crop.shape[0]
@@ -139,19 +148,20 @@ class _Mano:
 class _AssertContiguous(nn.Module):
     def forward(self, img_feat):
         assert img_feat.is_contiguous(), (
-            "MPS refinement features must be contiguous before first_conv"
+            "Refinement features must be contiguous before first_conv"
         )
         return img_feat
 
 
-@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is required")
-def test_wilor_forward_passes_contiguous_cropped_image_to_backbone_on_mps(
+@pytest.mark.parametrize("device", DEVICES)
+def test_wilor_forward_passes_contiguous_cropped_image_to_backbone(
+    device,
     lightweight_model_imports,
 ):
     WiLor, _ = lightweight_model_imports
     model = WiLor.__new__(WiLor)
     nn.Module.__init__(model)
-    model.backbone = _ContiguousBackbone()
+    model.backbone = _ContiguousBackbone(device)
     model.refine_net = _RefineNet()
     model.mano = _Mano()
     model.FOCAL_LENGTH = 5000
@@ -160,7 +170,7 @@ def test_wilor_forward_passes_contiguous_cropped_image_to_backbone_on_mps(
     model.IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).reshape(1, 1, 1, 3)
     model.eval()
 
-    image = torch.arange(256 * 256 * 3, device="mps", dtype=torch.float32).reshape(
+    image = torch.arange(256 * 256 * 3, device=device, dtype=torch.float32).reshape(
         1, 256, 256, 3
     )
 
@@ -172,9 +182,10 @@ def test_wilor_forward_passes_contiguous_cropped_image_to_backbone_on_mps(
 
 
 @pytest.mark.parametrize("deconv_cls_name", ["DeConvNet", "DeConvNet_v2"])
-@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is required")
-def test_refinement_deconv_makes_image_features_contiguous_before_first_conv_on_mps(
+@pytest.mark.parametrize("device", DEVICES)
+def test_refinement_deconv_makes_image_features_contiguous_before_first_conv(
     deconv_cls_name,
+    device,
     lightweight_model_imports,
 ):
     _, refinement_net = lightweight_model_imports
@@ -186,9 +197,9 @@ def test_refinement_deconv_makes_image_features_contiguous_before_first_conv_on_
         if isinstance(deconv.deconv, nn.ModuleList)
         else nn.Identity()
     )
-    deconv.to("mps")
+    deconv.to(device)
 
-    img_feat = torch.zeros(1, 4, 4, 8, device="mps").permute(0, 3, 1, 2)
+    img_feat = torch.zeros(1, 4, 4, 8, device=device).permute(0, 3, 1, 2)
     assert not img_feat.is_contiguous()
 
     deconv(img_feat)
