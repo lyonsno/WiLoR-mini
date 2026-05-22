@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import importlib
 import sys
 import types
 
@@ -7,25 +8,68 @@ import torch
 from torch import nn
 
 
-roma_stub = types.ModuleType("roma")
-roma_stub.rotmat_to_rotvec = lambda rotmats: torch.zeros(
-    *rotmats.shape[:-2], 3, device=rotmats.device, dtype=rotmats.dtype
-)
-sys.modules.setdefault("roma", roma_stub)
+@pytest.fixture()
+def lightweight_model_imports():
+    module_names = [
+        "roma",
+        "wilor_mini.models.vit",
+        "wilor_mini.models.mano_wrapper",
+        "wilor_mini.models.refinement_net",
+        "wilor_mini.models.wilor",
+    ]
+    sentinel = object()
+    previous_modules = {
+        name: sys.modules.get(name, sentinel)
+        for name in module_names
+    }
 
-vit_stub = types.ModuleType("wilor_mini.models.vit")
-vit_stub.vit = lambda **kwargs: None
-vit_stub.rot6d_to_rotmat = lambda x: x.reshape(-1, 2, 3).new_zeros(
-    x.shape[0], 3, 3
-)
-sys.modules.setdefault("wilor_mini.models.vit", vit_stub)
+    models_package = importlib.import_module("wilor_mini.models")
+    previous_attrs = {
+        name: getattr(models_package, name, sentinel)
+        for name in ("vit", "mano_wrapper", "refinement_net", "wilor")
+    }
 
-mano_wrapper_stub = types.ModuleType("wilor_mini.models.mano_wrapper")
-mano_wrapper_stub.MANO = lambda *args, **kwargs: None
-sys.modules.setdefault("wilor_mini.models.mano_wrapper", mano_wrapper_stub)
+    for name in module_names:
+        sys.modules.pop(name, None)
+    for name in previous_attrs:
+        if previous_attrs[name] is not sentinel:
+            delattr(models_package, name)
 
-from wilor_mini.models.refinement_net import DeConvNet, DeConvNet_v2
-from wilor_mini.models.wilor import WiLor
+    roma_stub = types.ModuleType("roma")
+    roma_stub.rotmat_to_rotvec = lambda rotmats: torch.zeros(
+        *rotmats.shape[:-2], 3, device=rotmats.device, dtype=rotmats.dtype
+    )
+
+    vit_stub = types.ModuleType("wilor_mini.models.vit")
+    vit_stub.vit = lambda **kwargs: None
+    vit_stub.rot6d_to_rotmat = lambda x: x.reshape(-1, 2, 3).new_zeros(
+        x.shape[0], 3, 3
+    )
+
+    mano_wrapper_stub = types.ModuleType("wilor_mini.models.mano_wrapper")
+    mano_wrapper_stub.MANO = lambda *args, **kwargs: None
+
+    sys.modules["roma"] = roma_stub
+    sys.modules["wilor_mini.models.vit"] = vit_stub
+    sys.modules["wilor_mini.models.mano_wrapper"] = mano_wrapper_stub
+
+    refinement_net = importlib.import_module("wilor_mini.models.refinement_net")
+    wilor = importlib.import_module("wilor_mini.models.wilor")
+
+    try:
+        yield wilor.WiLor, refinement_net
+    finally:
+        for name in module_names:
+            sys.modules.pop(name, None)
+        for name, module in previous_modules.items():
+            if module is not sentinel:
+                sys.modules[name] = module
+        for name in ("vit", "mano_wrapper", "refinement_net", "wilor"):
+            if hasattr(models_package, name):
+                delattr(models_package, name)
+        for name, value in previous_attrs.items():
+            if value is not sentinel:
+                setattr(models_package, name, value)
 
 
 class _ContiguousBackbone(nn.Module):
@@ -101,7 +145,10 @@ class _AssertContiguous(nn.Module):
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is required")
-def test_wilor_forward_passes_contiguous_cropped_image_to_backbone_on_mps():
+def test_wilor_forward_passes_contiguous_cropped_image_to_backbone_on_mps(
+    lightweight_model_imports,
+):
+    WiLor, _ = lightweight_model_imports
     model = WiLor.__new__(WiLor)
     nn.Module.__init__(model)
     model.backbone = _ContiguousBackbone()
@@ -124,11 +171,14 @@ def test_wilor_forward_passes_contiguous_cropped_image_to_backbone_on_mps():
     assert output["pred_keypoints_3d"].shape == (1, 21, 3)
 
 
-@pytest.mark.parametrize("deconv_cls", [DeConvNet, DeConvNet_v2])
+@pytest.mark.parametrize("deconv_cls_name", ["DeConvNet", "DeConvNet_v2"])
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is required")
 def test_refinement_deconv_makes_image_features_contiguous_before_first_conv_on_mps(
-    deconv_cls,
+    deconv_cls_name,
+    lightweight_model_imports,
 ):
+    _, refinement_net = lightweight_model_imports
+    deconv_cls = getattr(refinement_net, deconv_cls_name)
     deconv = deconv_cls(feat_dim=8)
     deconv.first_conv = _AssertContiguous()
     deconv.deconv = (
